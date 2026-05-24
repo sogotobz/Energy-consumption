@@ -1,0 +1,192 @@
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
+import warnings
+warnings.filterwarnings('ignore')
+import statsmodels.api as sm
+import datetime as dt
+import pmdarima as pm
+from prophet import Prophet
+from xgboost import XGBRegressor
+from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
+from sklearn.model_selection import train_test_split
+
+from statsmodels.tsa.arima.model import ARIMA
+from statsmodels.tsa.statespace.sarimax import SARIMAX
+from statsmodels.tsa.stattools import adfuller
+
+
+# Load the dataset
+df = pd.read_csv(r"C:\Users\sogot\Downloads\D202.csv\D202.csv", sep=',')
+print(df.head())
+print(df.columns)
+# print(df.describe())
+# print(df.info())
+# print(df.isnull().sum())
+# print(df.columns.to_list())
+
+# Convert 'Date' column to datetime
+df['Datetime'] = pd.to_datetime(
+    df['DATE'].astype(str).str.strip() + ' ' + df['START TIME'].astype(str).str.strip(),
+    errors='coerce',            # unparsable -> NaT so you can inspect them
+    infer_datetime_format=True,
+    dayfirst=False              # set True if your dates are DD/MM/YYYY
+)
+
+# report parsing issues
+n_bad = df['Datetime'].isna().sum()
+print(f"Parsed Datetime: {len(df)-n_bad} valid, {n_bad} invalid (NaT).")
+print(df['Datetime'].head())
+
+df = df.sort_values('Datetime').reset_index(drop=True)
+df.set_index('Datetime', inplace=True)
+
+df['USAGE']= pd.to_numeric(df['USAGE'].astype(str).str.replace(',','.'), errors='coerce')
+df['hour'] = df.index.hour
+df['day_of_week'] = df.index.dayofweek
+df['month'] = df.index.month
+df['year'] = df.index.year
+df['Is_weekend'] = df['day_of_week'].isin([5, 6]).astype(int)
+
+
+print("Index dtype:", df.index.dtype)
+print("Is monotonic:", df.index.is_monotonic_increasing)
+print("Is unique:", df.index.is_unique)
+print("Sample rows with USAGE:", df['USAGE'].head())
+
+print("Inferred freq (first 200 rows):", pd.infer_freq(df.index[:200]))
+
+hourly_sum = df['USAGE'].resample('H').sum()
+hourly_mean = df['USAGE'].resample('H').mean()
+
+print("Hourly Sum:\n", hourly_sum.head())
+print("Hourly Mean:\n", hourly_mean.head())
+
+
+train = hourly_mean.iloc[:-24]
+test = hourly_mean.iloc[-24:]
+model= SARIMAX(train, order=(1,1,1), seasonal_order=(1,1,1,24))
+sarimax_result = model.fit(disp=False)
+sarimax_forecast = sarimax_result.get_forecast(steps=24)
+sarimax_pred = sarimax_forecast.predicted_mean
+mae= mean_absolute_error(test, sarimax_pred)
+rmse = np.sqrt(mean_squared_error(test, sarimax_pred))
+sarimax_pred.index = test.index
+print("SARIMAX RMSE:", rmse)
+print("SARIMAX MAE:", mae)
+print("AIC:", sarimax_result.aic)
+print("BIC:", sarimax_result.bic)
+
+print("SARIMAX R²:", r2_score(test, sarimax_pred))
+print("SARIMAX Forecast for next 24 hours:\n", sarimax_forecast.summary_frame().tail(24))
+
+
+
+Prophet_df = hourly_mean.reset_index()
+Prophet_df.columns = ['ds','y']
+Prophet_df= Prophet_df.dropna()
+m = Prophet()
+m.fit(Prophet_df)
+future = m.make_future_dataframe(periods=24, freq='h')
+forecast_prophet = m.predict(future)
+print("Prophet Forecast for next 24 hours:\n", forecast_prophet[['ds', 'yhat', 'yhat_lower', 'yhat_upper']].tail(24))
+
+# XGBoost Model
+# ============================================
+print("\n" + "="*50)
+print("XGBOOST MODEL")
+print("="*50)
+
+# Create feature dataframe from hourly_mean
+hourly_df = hourly_mean.to_frame('y')
+hourly_df['hour'] = hourly_df.index.hour
+hourly_df['day_of_week'] = hourly_df.index.dayofweek
+hourly_df['month'] = hourly_df.index.month
+hourly_df['year'] = hourly_df.index.year
+hourly_df['is_weekend'] = hourly_df['day_of_week'].isin([5, 6]).astype(int)
+
+hourly_df = hourly_df.dropna() # Drop rows with NaN values in 'y' or features
+
+print("\nHourly DataFrame with features:")
+print(hourly_df.head())
+
+hourly_df['lag1'] = hourly_df['y'].shift(1)
+hourly_df['lag24'] = hourly_df['y'].shift(24)
+hourly_df['rolling_24'] = hourly_df['y'].rolling(24).mean()
+hourly_df['rolling_168'] = hourly_df['y'].rolling(168).mean()  # weekly pattern
+hourly_df = hourly_df.dropna()
+
+# split
+train_df = hourly_df.iloc[:-24]
+test_df  = hourly_df.iloc[-24:]
+
+
+print(f"\nTrain size: {len(train_df)}, Test size: {len(test_df)}")
+
+# Define features and target
+feature_cols = ['hour', 'day_of_week', 'month', 'year', 'is_weekend', 'lag1', 'lag24', 'rolling_24', 'rolling_168']
+X_train = train_df[feature_cols]
+y_train = train_df['y']
+
+X_test = test_df[feature_cols]
+y_test = test_df['y']
+print("\nTraining XGBoost model...")
+print("X_train shape:", X_train.shape)
+print("y_train shape:", y_train.shape)
+
+# Train XGBoost model
+
+xgb_model = XGBRegressor(
+    n_estimators=100,
+    learning_rate=0.1,
+    max_depth=5,
+    random_state=42
+)
+xgb_model.fit(X_train, y_train)
+
+# Predictions
+y_pred = xgb_model.predict(X_test)
+
+# Evaluation
+xgb_mae = mean_absolute_error(y_test, y_pred)
+xgb_mse = mean_squared_error(y_test, y_pred)
+xgb_rmse = np.sqrt(xgb_mse)
+xgb_r2 = r2_score(y_test, y_pred)
+
+print(f"\nXGBoost Performance:")
+print(f"  MAE:  {xgb_mae:.4f}")
+print(f"  MSE:  {xgb_mse:.4f}")
+print(f"  RMSE: {xgb_rmse:.4f}")
+print(f"  R²:   {xgb_r2:.4f}")
+
+
+plt.figure(figsize=(14,6))
+plt.plot(test.index, test, label='Actual', linewidth=2)
+plt.plot(test.index, sarimax_pred, label='SARIMAX')
+plt.plot(forecast_prophet['ds'].tail(24), forecast_prophet['yhat'].tail(24), label='Prophet')
+plt.plot(test_df.index, y_pred, label='XGBoost')
+
+plt.legend()
+plt.title("Actual vs Predicted Energy Usage")
+plt.show()
+
+results = pd.DataFrame({
+    'Model': ['SARIMAX', 'Prophet', 'XGBoost'],
+    'MAE': [mae, forecast_prophet['yhat'].tail(24).sub(test.values).abs().mean(), xgb_mae],
+    'RMSE': [rmse, np.sqrt(((forecast_prophet['yhat'].tail(24).values - test.values)**2).mean()), xgb_rmse],
+    'R2': [r2_score(test, sarimax_pred), None, xgb_r2]
+})
+
+print(results)
+
+plt.figure(figsize=(14,6))
+
+plt.plot(test.index, test, label='Actual', linewidth=2, color='black')
+plt.plot(test.index, sarimax_pred, label='SARIMAX', linestyle='--')
+plt.plot(forecast_prophet['ds'].tail(24), forecast_prophet['yhat'].tail(24), label='Prophet', linestyle='--')
+plt.plot(test_df.index, y_pred, label='XGBoost', linestyle='--')
+
+plt.legend()
+plt.title("24-Hour Forecast Comparison")
+plt.show()
